@@ -10,6 +10,9 @@
 #include "ride.hpp"
 #include "gps.hpp"
 
+#include "map_screen.hpp"
+#include <cstdio>
+
 namespace ui
 {
 
@@ -241,6 +244,7 @@ static void ui_task(void* param)
                 ride::get_ride_data();
 
             gps::State gps_data = gps::get_state();
+            map_screen::update(gps_data);
 
             char gps_text[48];
             if (!gps_data.receiving) {
@@ -318,9 +322,9 @@ static void ui_task(void* param)
             }
             lv_label_set_text(sensor_info_label, sensor_text);
             if (state == bluetooth::ConnectionState::Connected) {
-                lv_obj_add_flag(sensor_button, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_hidden(sensor_button, true);
             } else {
-                lv_obj_remove_flag(sensor_button, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_hidden(sensor_button, false);
                 lv_label_set_text(sensor_button_label,
                     state == bluetooth::ConnectionState::Idle ? "Search" : "Cancel");
             }
@@ -726,6 +730,9 @@ void init()
     lv_obj_center(sensor_button_label);
     lv_obj_add_event_cb(sensor_button, sensor_button_event_cb,
                        LV_EVENT_CLICKED, nullptr);
+
+
+    map_screen::create(screen);
 
 
     // -------------------------
