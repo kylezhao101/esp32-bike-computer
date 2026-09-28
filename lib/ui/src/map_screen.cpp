@@ -1,5 +1,5 @@
 #include "map_screen.hpp"
-#include "map_tiles.h"
+#include "map_frame.hpp"
 #include "map_geo.h"
 #include "esp_timer.h"
 #include <cmath>
@@ -8,37 +8,28 @@
 
 namespace ui::map_screen {
 namespace {
-constexpr int width = 320;
-constexpr int height = 240;
-constexpr int tile_size = MAP_TILES_TILE_SIZE;
-constexpr int zoom = 16;
-constexpr int tile_count = 1 << zoom;
-constexpr int columns = 3;
-constexpr int rows = 2;
+constexpr int width = map_frame::width;
+constexpr int height = map_frame::height;
+constexpr int zoom = map_frame::zoom;
+// Keep the map still for small GPS movements; move the marker instead.
+constexpr int recenter_distance_px = 12;
 
-struct Tile {
-    lv_obj_t* image = nullptr;
-    int x = -1;
-    int y = -1;
-    bool available = false;
-};
-
-Tile tiles[columns * rows];
-map_tiles_handle_t map = nullptr;
+lv_obj_t* images[map_frame::max_pieces]{};
 lv_obj_t* viewport = nullptr;
 lv_obj_t* marker = nullptr;
 lv_obj_t* status = nullptr;
-bool positioned = false;
+bool cache_ready = false;
+bool requested = false;
+bool load_failed = false;
+int active_frame = -1;
+int loading_frame = -1;
+int requested_left = 0;
+int requested_top = 0;
 bool had_fix = false;
-int previous_left = 0;
-int previous_top = 0;
-int missing_tiles = 0;
+bool marker_has_fix = false;
+int fix_x = 0;
+int fix_y = 0;
 int64_t last_update_us = 0;
-
-int wrap(int value, int modulus)
-{
-    return (value % modulus + modulus) % modulus;
-}
 
 void set_status(const char* text)
 {
@@ -46,51 +37,38 @@ void set_status(const char* text)
         lv_label_set_text(status, text);
 }
 
-void position_tiles(double latitude, double longitude)
+void accept_frame(int index)
 {
-    // Round the shared viewport origin once to keep all tile edges adjacent.
-    const int left = static_cast<int>(std::lround(
-        map_geo_lon_to_world_px(longitude, zoom))) - width / 2;
-    const int top = static_cast<int>(std::lround(
-        map_geo_lat_to_world_py(latitude, zoom))) - height / 2;
-    if (positioned && left == previous_left && top == previous_top) return;
-    previous_left = left;
-    previous_top = top;
-    positioned = true;
-
-    const int first_x = static_cast<int>(std::floor(double(left) / tile_size));
-    const int last_x = static_cast<int>(std::floor(double(left + width - 1) / tile_size));
-    const int first_y = static_cast<int>(std::floor(double(top) / tile_size));
-    const int last_y = static_cast<int>(std::floor(double(top + height - 1) / tile_size));
-    bool visible[columns * rows]{};
-    missing_tiles = 0;
-
-    for (int y = first_y; y <= last_y; ++y) {
-        if (y < 0 || y >= tile_count) continue; // No vertical wrapping at the poles.
-        for (int x = first_x; x <= last_x; ++x) {
-            // Stable slots keep overlapping tiles when crossing a tile boundary.
-            const int slot = wrap(y, rows) * columns + wrap(x, columns);
-            Tile& tile = tiles[slot];
-            const int wrapped_x = wrap(x, tile_count);
-            if (tile.x != wrapped_x || tile.y != y) {
-                tile.x = wrapped_x;
-                tile.y = y;
-                char source[260];
-                tile.available = map_tiles_get_file_source(map, wrapped_x, y,
-                                                           source, sizeof(source));
-                if (tile.available) lv_image_set_src(tile.image, source);
-            }
-            visible[slot] = tile.available;
-            if (tile.available) {
-                lv_obj_set_pos(tile.image, x * tile_size - left, y * tile_size - top);
-            } else {
-                ++missing_tiles;
-            }
+    const auto& frame = map_frame::get(index);
+    load_failed = frame.failed;
+    if (frame.failed) return; // Keep the previously completed viewport.
+    for (int i = 0; i < map_frame::max_pieces; ++i) {
+        if (i < frame.count) {
+            const auto& piece = frame.pieces[i];
+            lv_image_set_src(images[i], &piece.image);
+            lv_obj_set_pos(images[i], piece.x, piece.y);
+            lv_obj_set_hidden(images[i], false);
+        } else {
+            lv_obj_set_hidden(images[i], true);
+            lv_image_set_src(images[i], nullptr);
         }
     }
-    for (int i = 0; i < columns * rows; ++i) {
-        lv_obj_set_hidden(tiles[i].image, !visible[i]);
-    }
+    // No image object references the previous buffer now. With RAM_LOAD=0,
+    // indexed images are row-decoded without caching an expanded image.
+    active_frame = index;
+}
+
+void request_frame(int left, int top)
+{
+    if (loading_frame >= 0) return;
+    if (requested && std::abs(left - requested_left) < recenter_distance_px &&
+        std::abs(top - requested_top) < recenter_distance_px) return;
+    const int next = active_frame == 0 ? 1 : 0;
+    if (!map_frame::request(next, left, top)) return;
+    loading_frame = next;
+    requested_left = left;
+    requested_top = top;
+    requested = true;
 }
 
 void toggle(lv_event_t* event)
@@ -119,15 +97,6 @@ void button(lv_obj_t* parent, const char* text, lv_align_t align)
 
 void create(lv_obj_t* parent)
 {
-    map_tiles_config_t config{};
-    config.base_path = "/sdcard";
-    config.tile_folders[0] = "tiles1";
-    config.tile_type_count = 1;
-    config.default_zoom = zoom;
-    config.grid_cols = 1;
-    config.grid_rows = 1;
-    map = map_tiles_init(&config); // Coordinate/file metadata only, no tile buffers.
-
     button(parent, "Map", LV_ALIGN_BOTTOM_RIGHT);
     viewport = lv_obj_create(parent);
     lv_obj_remove_style_all(viewport);
@@ -137,15 +106,15 @@ void create(lv_obj_t* parent)
     lv_obj_set_style_bg_color(viewport, lv_color_hex(0x30343b), 0);
     lv_obj_set_style_bg_opa(viewport, LV_OPA_COVER, 0);
 
-    for (Tile& tile : tiles) {
-        tile.image = lv_image_create(viewport);
-        lv_obj_set_hidden(tile.image, true);
-        lv_obj_set_clickable(tile.image, false);
+    for (auto& image : images) {
+        image = lv_image_create(viewport);
+        lv_obj_set_hidden(image, true);
+        lv_obj_set_clickable(image, false);
     }
     marker = lv_obj_create(viewport);
     lv_obj_remove_style_all(marker);
     lv_obj_set_size(marker, 12, 12);
-    lv_obj_center(marker);
+    lv_obj_set_pos(marker, width / 2 - 6, height / 2 - 6);
     lv_obj_set_style_radius(marker, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_opa(marker, LV_OPA_COVER, 0);
     lv_obj_set_style_bg_color(marker, lv_color_hex(0x168bff), 0);
@@ -164,20 +133,26 @@ void create(lv_obj_t* parent)
     lv_label_set_text(status, "Waiting for GPS");
     button(viewport, "Back", LV_ALIGN_BOTTOM_RIGHT);
 
-    // Preserve the previous test area as an explicitly labelled preview until
-    // GPS acquires a fix. Never show a live-position marker at this fallback.
-    if (map) position_tiles(49.21486, -123.12683);
+    // Start after creating the UI so the cache's heap check includes its cost.
+    cache_ready = map_frame::init();
     update(gps::get_state());
 }
 
 void update(const gps::State& position)
 {
-    if (!viewport || lv_obj_is_hidden(viewport)) return;
+    if (!viewport) return;
+    // Consume completions even while the map is hidden. Returning to it uses
+    // the prepared RAM image instead of reopening tile files on the UI thread.
+    const int completed = map_frame::poll();
+    if (completed >= 0) {
+        loading_frame = -1;
+        accept_frame(completed);
+    }
     const int64_t now = esp_timer_get_time();
-    if (last_update_us && now - last_update_us < 250000) return;
+    if (completed < 0 && last_update_us && now - last_update_us < 250000) return;
     last_update_us = now;
-    if (!map) {
-        set_status("Map unavailable");
+    if (!cache_ready) {
+        set_status("Not enough memory for map");
         return;
     }
     const bool valid = position.receiving && position.has_fix &&
@@ -185,15 +160,41 @@ void update(const gps::State& position)
                        position.latitude >= -90 && position.latitude <= 90 &&
                        position.longitude >= -180 && position.longitude <= 180;
     if (valid) {
-        position_tiles(position.latitude, position.longitude);
+        fix_x = static_cast<int>(std::lround(map_geo_lon_to_world_px(position.longitude, zoom)));
+        fix_y = static_cast<int>(std::lround(map_geo_lat_to_world_py(position.latitude, zoom)));
         had_fix = true;
-        lv_obj_set_hidden(marker, false);
-        lv_obj_set_style_bg_color(marker, lv_color_hex(0x168bff), 0);
-    } else if (had_fix) {
+    }
+    // Before a fix, retain the explicitly labelled preview of the test area.
+    const int center_x = had_fix ? fix_x : static_cast<int>(std::lround(
+        map_geo_lon_to_world_px(-123.12683, zoom)));
+    const int center_y = had_fix ? fix_y : static_cast<int>(std::lround(
+        map_geo_lat_to_world_py(49.21486, zoom)));
+    request_frame(center_x - width / 2, center_y - height / 2);
+
+    int missing_tiles = 0;
+    if (active_frame >= 0) {
+        const auto& frame = map_frame::get(active_frame);
+        missing_tiles = frame.missing;
+        const int x = fix_x - frame.left;
+        const int y = fix_y - frame.top;
+        // Do not pin a stale/far-away fix to the center while a new map loads.
+        const bool visible = had_fix && x >= 0 && x < width && y >= 0 && y < height;
+        if (visible) lv_obj_set_pos(marker, x - 6, y - 6);
+        lv_obj_set_hidden(marker, !visible);
+    }
+    if (valid) {
+        if (!marker_has_fix)
+            lv_obj_set_style_bg_color(marker, lv_color_hex(0x168bff), 0);
+    } else if (marker_has_fix) {
         lv_obj_set_style_bg_color(marker, lv_color_hex(0x999999), 0);
     }
+    marker_has_fix = valid;
     char text[96];
-    if (valid) {
+    if (load_failed) {
+        std::snprintf(text, sizeof(text), "Map update failed");
+    } else if (active_frame < 0) {
+        std::snprintf(text, sizeof(text), "Loading map | %s", had_fix ? "GPS" : "Preview");
+    } else if (valid) {
         if (missing_tiles)
             std::snprintf(text, sizeof(text), "GPS | z%d | %d tiles missing", zoom, missing_tiles);
         else

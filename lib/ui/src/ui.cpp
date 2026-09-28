@@ -2,6 +2,10 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_attr.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "display.hpp"
 #include <lvgl.h>
@@ -18,7 +22,64 @@ namespace ui
 
 static LGFX display;
 
-static uint16_t draw_buffer[320 * 20];
+// LVGL renders into one strip while SPI DMA transmits the other.
+DMA_ATTR static uint16_t draw_buffer[320 * 20];
+DMA_ATTR static uint16_t draw_buffer_next[320 * 20];
+static bool flush_pending = false;
+static int64_t dma_wait_us = 0;
+static uint32_t refresh_pixels = 0;
+
+static void finish_display_transfer()
+{
+    if (!flush_pending) return;
+    const int64_t start = esp_timer_get_time();
+    display.waitDMA();
+    display.endWrite();
+    dma_wait_us += esp_timer_get_time() - start;
+    flush_pending = false;
+}
+
+static uint32_t ui_tick_ms()
+{
+    return static_cast<uint32_t>(esp_timer_get_time() / 1000);
+}
+
+static void display_refresh_event(lv_event_t* event)
+{
+    static int64_t started = 0;
+    static int64_t last_report = 0;
+    static int64_t total_us = 0;
+    static int64_t max_us = 0;
+    static int64_t total_wait_us = 0;
+    static uint32_t frames = 0;
+    static uint32_t pixels = 0;
+    if (lv_event_get_code(event) == LV_EVENT_REFR_START) {
+        finish_display_transfer();
+        started = esp_timer_get_time();
+        dma_wait_us = 0;
+        refresh_pixels = 0;
+        return;
+    }
+    finish_display_transfer();
+    if (!refresh_pixels) return;
+    const int64_t now = esp_timer_get_time();
+    const int64_t elapsed = now - started;
+    total_us += elapsed;
+    if (elapsed > max_us) max_us = elapsed;
+    total_wait_us += dma_wait_us;
+    pixels += refresh_pixels;
+    ++frames;
+    if (now - last_report < 5000000) return;
+    ESP_LOGI("ui_perf", "refresh avg/max %lld/%lld ms, DMA wait avg %lld ms, "
+             "avg %lu pixels, free/largest heap %u/%u bytes",
+             total_us / frames / 1000, max_us / 1000,
+             total_wait_us / frames / 1000, static_cast<unsigned long>(pixels / frames),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    last_report = now;
+    total_us = max_us = total_wait_us = 0;
+    frames = pixels = 0;
+}
 
 static lv_obj_t* left_panel = nullptr;
 static lv_obj_t* right_panel = nullptr;
@@ -115,6 +176,8 @@ static void lvgl_touch_cb(
     uint16_t raw_x;
     uint16_t raw_y;
 
+    finish_display_transfer();
+
     if (display.getTouch(
             &raw_x,
             &raw_y
@@ -142,7 +205,7 @@ static void lvgl_touch_cb(
 // -------------------------
 
 static void lvgl_flush_cb(
-    lv_display_t* lv_display,
+    lv_display_t*,
     const lv_area_t* area,
     uint8_t* px_map
 )
@@ -152,7 +215,12 @@ static void lvgl_flush_cb(
 
     int32_t height =
         area->y2 - area->y1 + 1;
+    refresh_pixels += width * height;
 
+    finish_display_transfer();
+    // Send native SPI byte order directly, avoiding LovyanGFX's conversion
+    // buffers. LVGL redraws this partial buffer before reusing it.
+    lv_draw_rgb565_swap(px_map, width * height);
     display.startWrite();
 
     display.setAddrWindow(
@@ -162,14 +230,18 @@ static void lvgl_flush_cb(
         height
     );
 
-    display.pushPixels(
+    display.writePixelsDMA(
         reinterpret_cast<uint16_t*>(px_map),
-        width * height
+        width * height,
+        false
     );
+    flush_pending = true;
+    // The wait callback ends the transaction before LVGL reuses this buffer.
+}
 
-    display.endWrite();
-
-    lv_display_flush_ready(lv_display);
+static void lvgl_flush_wait_cb(lv_display_t*)
+{
+    finish_display_transfer();
 }
 
 
@@ -222,18 +294,17 @@ static void ui_task(void* param)
     char distance_text[32];
     char elapsed_text[32];
 
-    int ui_update_counter = 0;
+    uint32_t last_ui_update = ui_tick_ms();
 
     while (true)
     {
-        lv_tick_inc(10);
         lv_timer_handler();
+        finish_display_transfer();
 
-        ui_update_counter += 10;
-
-        if (ui_update_counter >= 100)
+        const uint32_t now = ui_tick_ms();
+        if (now - last_ui_update >= 100)
         {
-            ui_update_counter = 0;
+            last_ui_update = now;
 
             bluetooth::SensorData sensor_data =
                 bluetooth::get_sensor_data();
@@ -396,11 +467,13 @@ static void ui_task(void* param)
 void init()
 {
     display.init();
+    display.initDMA();
     display.setSwapBytes(true);
     display.setRotation(1);
     display.setBrightness(255);
 
     lv_init();
+    lv_tick_set_cb(ui_tick_ms);
 
 
     // -------------------------
@@ -416,11 +489,14 @@ void init()
         lv_display,
         lvgl_flush_cb
     );
+    lv_display_set_flush_wait_cb(lv_display, lvgl_flush_wait_cb);
+    lv_display_add_event_cb(lv_display, display_refresh_event, LV_EVENT_REFR_START, nullptr);
+    lv_display_add_event_cb(lv_display, display_refresh_event, LV_EVENT_REFR_READY, nullptr);
 
     lv_display_set_buffers(
         lv_display,
         draw_buffer,
-        nullptr,
+        draw_buffer_next,
         sizeof(draw_buffer),
         LV_DISPLAY_RENDER_MODE_PARTIAL
     );
