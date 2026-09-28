@@ -1,0 +1,8 @@
+{
+    "name": "ui",
+    "version": "1.0.0",
+    "dependencies": {
+        "lovyan03/LovyanGFX": "^1.2.30",
+        "lvgl/lvgl": "^9.6.0"
+    }
+}
