@@ -17,6 +17,7 @@
 
 #include "map_screen.hpp"
 #include <cstdio>
+#include <cstring>
 
 namespace ui
 {
@@ -84,6 +85,8 @@ static void display_refresh_event(lv_event_t* event)
 
 static lv_obj_t* left_panel = nullptr;
 static lv_obj_t* right_panel = nullptr;
+static lv_obj_t* dashboard_screen = nullptr;
+static lv_obj_t* sensor_screen = nullptr;
 
 static lv_obj_t* speed_title = nullptr;
 static lv_obj_t* speed_label = nullptr;
@@ -153,7 +156,20 @@ static lv_obj_t* sensor_info_label = nullptr;
 static lv_obj_t* gps_status_label = nullptr;
 static lv_obj_t* sensor_button = nullptr;
 static lv_obj_t* sensor_button_label = nullptr;
+static lv_obj_t* fit_error_dialog = nullptr;
 static int64_t next_record_sample_us = 0;
+
+static void show_sensor_page_event_cb(lv_event_t* event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED && sensor_screen)
+        lv_screen_load(sensor_screen);
+}
+
+static void show_dashboard_page_event_cb(lv_event_t* event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED && dashboard_screen)
+        lv_screen_load(dashboard_screen);
+}
 
 static void sensor_button_event_cb(lv_event_t* event)
 {
@@ -276,6 +292,25 @@ static void lvgl_flush_cb(
     // The wait callback ends the transaction before LVGL reuses this buffer.
 }
 
+static void close_fit_error_event_cb(lv_event_t* event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    lv_obj_t* dialog = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+    if (fit_error_dialog == dialog) fit_error_dialog = nullptr;
+    lv_msgbox_close(dialog);
+}
+
+static void show_fit_error(const char* message)
+{
+    if (fit_error_dialog) return;
+    fit_error_dialog = lv_msgbox_create(nullptr);
+    lv_msgbox_add_title(fit_error_dialog, "Ride recording error");
+    lv_msgbox_add_text(fit_error_dialog, message);
+    lv_obj_t* ok = lv_msgbox_add_footer_button(fit_error_dialog, "OK");
+    lv_obj_add_event_cb(ok, close_fit_error_event_cb, LV_EVENT_CLICKED,
+                        fit_error_dialog);
+}
+
 static void lvgl_flush_wait_cb(lv_display_t*)
 {
     finish_display_transfer();
@@ -285,6 +320,31 @@ static void lvgl_flush_wait_cb(lv_display_t*)
 // -------------------------
 // Ride button
 // -------------------------
+
+static void finish_ride()
+{
+    update_ride();
+    ride::stop();
+    const auto final_sample = sample_ride_for_recording();
+    const bool sample_queued = fit_recorder::submit(final_sample);
+    const bool stop_queued = fit_recorder::stop(ride::get_ride_data());
+    lv_label_set_text(ride_button_label, "START");
+
+    if (!sample_queued || !stop_queued)
+        show_fit_error("Could not queue all ride data for saving. The FIT file may be incomplete.");
+}
+
+static void end_ride_confirmation_event_cb(lv_event_t* event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    lv_obj_t* dialog = static_cast<lv_obj_t*>(lv_event_get_user_data(event));
+    lv_obj_t* button = lv_event_get_target_obj(event);
+    lv_obj_t* label = lv_obj_get_child(button, 0);
+    const bool confirmed = label &&
+        std::strcmp(lv_label_get_text(label), "End Ride") == 0;
+    lv_msgbox_close(dialog);
+    if (confirmed) finish_ride();
+}
 
 static void ride_button_event_cb(
     lv_event_t* event
@@ -298,22 +358,20 @@ static void ride_button_event_cb(
 
     if (ride_data.active)
     {
-        update_ride();
-        ride::stop();
-        auto final_sample = sample_ride_for_recording();
-        fit_recorder::submit(final_sample);
-        if (!fit_recorder::stop(ride::get_ride_data()))
-            ESP_LOGE("ui", "Could not queue FIT finalization");
-
-        lv_label_set_text(
-            ride_button_label,
-            "START"
-        );
+        lv_obj_t* dialog = lv_msgbox_create(nullptr);
+        lv_msgbox_add_title(dialog, "End this ride?");
+        lv_msgbox_add_text(dialog, "Save the ride and stop recording?");
+        lv_obj_t* cancel = lv_msgbox_add_footer_button(dialog, "Cancel");
+        lv_obj_add_event_cb(cancel, end_ride_confirmation_event_cb,
+                            LV_EVENT_CLICKED, dialog);
+        lv_obj_t* end = lv_msgbox_add_footer_button(dialog, "End Ride");
+        lv_obj_add_event_cb(end, end_ride_confirmation_event_cb,
+                            LV_EVENT_CLICKED, dialog);
     }
     else
     {
         if (!fit_recorder::start()) {
-            lv_label_set_text(gps_status_label, "FIT recorder unavailable");
+            show_fit_error("FIT recorder is unavailable. Check the SD card and restart the device.");
             return;
         }
         ride::start();
@@ -342,6 +400,7 @@ static void ui_task(void* param)
     char elapsed_text[32];
 
     uint32_t last_ui_update = ui_tick_ms();
+    auto previous_fit_status = fit_recorder::status();
     while (true)
     {
         lv_timer_handler();
@@ -447,7 +506,14 @@ static void ui_task(void* param)
             }
             lv_label_set_text(sensor_info_label, sensor_text);
             const auto fit_state = fit_recorder::status();
-            if (ride_data.active && fit_state == fit_recorder::Status::WaitingForTime)
+            if (fit_state == fit_recorder::Status::Error &&
+                previous_fit_status != fit_recorder::Status::Error) {
+                show_fit_error("The FIT ride file could not be saved completely. Check the SD card.");
+            }
+            previous_fit_status = fit_state;
+            if (fit_state == fit_recorder::Status::Unavailable)
+                lv_label_set_text(sensor_info_label, "FIT recorder unavailable");
+            else if (ride_data.active && fit_state == fit_recorder::Status::WaitingForTime)
                 lv_label_set_text(sensor_info_label, "Recording | waiting for GPS time");
             else if (fit_state == fit_recorder::Status::Error)
                 lv_label_set_text(sensor_info_label, "FIT write error | ride data at risk");
@@ -585,8 +651,9 @@ void init()
     );
 
 
-    lv_obj_t* screen =
-        lv_screen_active();
+    lv_obj_t* screen = lv_screen_active();
+    dashboard_screen = screen;
+    lv_obj_set_scrollable(dashboard_screen, false);
 
 
     // -------------------------
@@ -598,9 +665,10 @@ void init()
 
     lv_obj_set_size(
         left_panel,
-        190,
-        150
+        160,
+        165
     );
+    lv_obj_set_scrollable(left_panel, false);
 
     lv_obj_align(
         left_panel,
@@ -652,9 +720,9 @@ void init()
 
     lv_obj_align(
         speed_label,
-        LV_ALIGN_LEFT_MID,
+        LV_ALIGN_TOP_LEFT,
         10,
-        -8
+        31
     );
 
     speed_unit =
@@ -665,17 +733,11 @@ void init()
         "km/h"
     );
 
-    lv_obj_set_style_text_font(
-        speed_unit,
-        &lv_font_montserrat_24,
-        0
-    );
-
     lv_obj_align(
         speed_unit,
-        LV_ALIGN_BOTTOM_LEFT,
+        LV_ALIGN_TOP_LEFT,
         10,
-        -10
+        88
     );
 
 
@@ -688,9 +750,10 @@ void init()
 
     lv_obj_set_size(
         right_panel,
-        130,
-        150
+        160,
+        165
     );
+    lv_obj_set_scrollable(right_panel, false);
 
     lv_obj_align(
         right_panel,
@@ -722,7 +785,7 @@ void init()
     lv_obj_align(
         cadence_title,
         LV_ALIGN_TOP_LEFT,
-        5,
+        10,
         8
     );
 
@@ -742,9 +805,9 @@ void init()
 
     lv_obj_align(
         cadence_label,
-        LV_ALIGN_LEFT_MID,
-        5,
-        -8
+        LV_ALIGN_TOP_LEFT,
+        10,
+        31
     );
 
     cadence_unit =
@@ -755,17 +818,11 @@ void init()
         "rpm"
     );
 
-    lv_obj_set_style_text_font(
-        cadence_unit,
-        &lv_font_montserrat_24,
-        0
-    );
-
     lv_obj_align(
         cadence_unit,
-        LV_ALIGN_BOTTOM_LEFT,
-        5,
-        -10
+        LV_ALIGN_TOP_LEFT,
+        10,
+        88
     );
 
 
@@ -774,35 +831,27 @@ void init()
     // -------------------------
 
     distance_label =
-        lv_label_create(screen);
+        lv_label_create(left_panel);
 
     lv_label_set_text(
         distance_label,
         "0.00 km"
     );
+    lv_obj_set_style_text_font(distance_label, &lv_font_montserrat_24, 0);
 
-    lv_obj_align(
-        distance_label,
-        LV_ALIGN_BOTTOM_MID,
-        -45,
-        -42
-    );
+    lv_obj_align(distance_label, LV_ALIGN_TOP_LEFT, 10, 122);
 
 
     elapsed_label =
-        lv_label_create(screen);
+        lv_label_create(right_panel);
 
     lv_label_set_text(
         elapsed_label,
         "00:00"
     );
+    lv_obj_set_style_text_font(elapsed_label, &lv_font_montserrat_24, 0);
 
-    lv_obj_align(
-        elapsed_label,
-        LV_ALIGN_BOTTOM_MID,
-        55,
-        -42
-    );
+    lv_obj_align(elapsed_label, LV_ALIGN_TOP_LEFT, 10, 122);
 
 
     // -------------------------
@@ -846,25 +895,57 @@ void init()
 
 
     // -------------------------
-    // Sensor info
+    // Sensors page navigation
     // -------------------------
 
-    sensor_info_label = lv_label_create(screen);
-    lv_obj_set_width(sensor_info_label, 220);
-    lv_label_set_text(sensor_info_label, "Searching for sensor...");
-    lv_obj_align(sensor_info_label, LV_ALIGN_TOP_LEFT, 8, 151);
+    lv_obj_t* sensors_page_button = lv_button_create(screen);
+    lv_obj_set_size(sensors_page_button, 80, 34);
+    lv_obj_align(sensors_page_button, LV_ALIGN_BOTTOM_MID, 0, -3);
+    lv_obj_t* sensors_page_label = lv_label_create(sensors_page_button);
+    lv_label_set_text(sensors_page_label, "Sensors");
+    lv_obj_center(sensors_page_label);
+    lv_obj_add_event_cb(sensors_page_button, show_sensor_page_event_cb,
+                       LV_EVENT_CLICKED, nullptr);
 
-    gps_status_label = lv_label_create(screen);
+    // -------------------------
+    // Sensors page
+    // -------------------------
+
+    sensor_screen = lv_obj_create(nullptr);
+    lv_obj_set_scrollable(sensor_screen, false);
+
+    lv_obj_t* sensor_page_title = lv_label_create(sensor_screen);
+    lv_label_set_text(sensor_page_title, "SENSORS");
+    lv_obj_align(sensor_page_title, LV_ALIGN_TOP_LEFT, 16, 18);
+
+    gps_status_label = lv_label_create(sensor_screen);
+    lv_obj_set_width(gps_status_label, 288);
     lv_label_set_text(gps_status_label, "GPS disconnected");
-    lv_obj_align(gps_status_label, LV_ALIGN_TOP_LEFT, 8, 184);
+    lv_obj_align(gps_status_label, LV_ALIGN_TOP_LEFT, 16, 58);
 
-    sensor_button = lv_button_create(screen);
-    lv_obj_set_size(sensor_button, 76, 34);
-    lv_obj_align(sensor_button, LV_ALIGN_TOP_RIGHT, -8, 150);
+    sensor_info_label = lv_label_create(sensor_screen);
+    lv_obj_set_width(sensor_info_label, 288);
+    lv_obj_set_height(sensor_info_label, 48);
+    lv_label_set_long_mode(sensor_info_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(sensor_info_label, "Searching for sensor...");
+    lv_obj_align(sensor_info_label, LV_ALIGN_TOP_LEFT, 16, 88);
+
+    sensor_button = lv_button_create(sensor_screen);
+    lv_obj_set_size(sensor_button, 90, 36);
+    lv_obj_align(sensor_button, LV_ALIGN_TOP_LEFT, 16, 146);
     sensor_button_label = lv_label_create(sensor_button);
     lv_label_set_text(sensor_button_label, "Cancel");
     lv_obj_center(sensor_button_label);
     lv_obj_add_event_cb(sensor_button, sensor_button_event_cb,
+                       LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t* back_button = lv_button_create(sensor_screen);
+    lv_obj_set_size(back_button, 76, 34);
+    lv_obj_align(back_button, LV_ALIGN_BOTTOM_LEFT, 8, -3);
+    lv_obj_t* back_label = lv_label_create(back_button);
+    lv_label_set_text(back_label, "Back");
+    lv_obj_center(back_label);
+    lv_obj_add_event_cb(back_button, show_dashboard_page_event_cb,
                        LV_EVENT_CLICKED, nullptr);
 
 

@@ -1,6 +1,8 @@
 #include "map_screen.hpp"
 #include "map_frame.hpp"
 #include "map_geo.h"
+#include "bluetooth.hpp"
+#include "ride.hpp"
 #include "esp_timer.h"
 #include <cmath>
 #include <cstdio>
@@ -18,6 +20,10 @@ lv_obj_t* images[map_frame::max_pieces]{};
 lv_obj_t* viewport = nullptr;
 lv_obj_t* marker = nullptr;
 lv_obj_t* status = nullptr;
+lv_obj_t* speed_value = nullptr;
+lv_obj_t* distance_value = nullptr;
+lv_obj_t* elapsed_value = nullptr;
+lv_obj_t* cadence_value = nullptr;
 bool cache_ready = false;
 bool requested = false;
 bool load_failed = false;
@@ -35,6 +41,76 @@ void set_status(const char* text)
 {
     if (std::strcmp(lv_label_get_text(status), text) != 0)
         lv_label_set_text(status, text);
+}
+
+void set_label_text_if_changed(lv_obj_t* label, const char* text)
+{
+    if (std::strcmp(lv_label_get_text(label), text) != 0)
+        lv_label_set_text(label, text);
+}
+
+lv_obj_t* stat_cell(lv_obj_t* parent, int x, int width,
+                    const char* title, lv_obj_t*& value)
+{
+    lv_obj_t* cell = lv_obj_create(parent);
+    lv_obj_remove_style_all(cell);
+    lv_obj_set_size(cell, width, 52);
+    lv_obj_set_pos(cell, x, 0);
+    lv_obj_set_scrollable(cell, false);
+
+    lv_obj_t* heading = lv_label_create(cell);
+    lv_label_set_text(heading, title);
+    lv_obj_set_style_text_color(heading, lv_color_hex(0xc9d1d9), 0);
+    lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 1);
+
+    value = lv_label_create(cell);
+    lv_label_set_text(value, "--");
+    lv_obj_set_style_text_color(value, lv_color_white(), 0);
+    lv_obj_set_style_text_font(value, &lv_font_montserrat_24, 0);
+    lv_obj_align(value, LV_ALIGN_BOTTOM_MID, 0, -1);
+    return cell;
+}
+
+void update_stats(const gps::State& position)
+{
+    const int64_t now = esp_timer_get_time();
+    const auto sensor = bluetooth::get_sensor_data();
+    const auto ride_data = ride::get_ride_data();
+    char text[24];
+
+    if (sensor.wheel_supported) {
+        const float speed = now < sensor.speed_valid_until_us ? sensor.speed_kmh : 0.0f;
+        std::snprintf(text, sizeof(text), "%.1f", speed);
+    } else if (position.has_speed) {
+        std::snprintf(text, sizeof(text), "%.1f", position.speed_kmh);
+    } else {
+        std::snprintf(text, sizeof(text), "--");
+    }
+    set_label_text_if_changed(speed_value, text);
+
+    std::snprintf(text, sizeof(text), "%.1f", ride_data.distance_km);
+    set_label_text_if_changed(distance_value, text);
+
+    const uint32_t hours = ride_data.elapsed_seconds / 3600;
+    const uint32_t minutes = (ride_data.elapsed_seconds % 3600) / 60;
+    const uint32_t seconds = ride_data.elapsed_seconds % 60;
+    if (hours)
+        std::snprintf(text, sizeof(text), "%lu:%02lu",
+                      static_cast<unsigned long>(hours),
+                      static_cast<unsigned long>(minutes));
+    else
+        std::snprintf(text, sizeof(text), "%02lu:%02lu",
+                      static_cast<unsigned long>(minutes),
+                      static_cast<unsigned long>(seconds));
+    set_label_text_if_changed(elapsed_value, text);
+
+    if (sensor.crank_supported) {
+        const float cadence = now < sensor.cadence_valid_until_us ? sensor.cadence_rpm : 0.0f;
+        std::snprintf(text, sizeof(text), "%.0f", cadence);
+    } else {
+        std::snprintf(text, sizeof(text), "--");
+    }
+    set_label_text_if_changed(cadence_value, text);
 }
 
 void accept_frame(int index)
@@ -87,7 +163,7 @@ void button(lv_obj_t* parent, const char* text, lv_align_t align)
 {
     lv_obj_t* obj = lv_button_create(parent);
     lv_obj_set_size(obj, 64, 32);
-    lv_obj_align(obj, align, -6, -4);
+    lv_obj_align(obj, align, -6, align == LV_ALIGN_TOP_RIGHT ? 4 : -4);
     lv_obj_t* label = lv_label_create(obj);
     lv_label_set_text(label, text);
     lv_obj_center(label);
@@ -131,7 +207,20 @@ void create(lv_obj_t* parent)
     lv_obj_set_style_pad_all(status, 4, 0);
     lv_obj_align(status, LV_ALIGN_TOP_LEFT, 4, 4);
     lv_label_set_text(status, "Waiting for GPS");
-    button(viewport, "Back", LV_ALIGN_BOTTOM_RIGHT);
+    button(viewport, "Back", LV_ALIGN_TOP_RIGHT);
+
+    lv_obj_t* stats = lv_obj_create(viewport);
+    lv_obj_remove_style_all(stats);
+    lv_obj_set_size(stats, width, 52);
+    lv_obj_set_pos(stats, 0, height - 52);
+    lv_obj_set_scrollable(stats, false);
+    lv_obj_set_style_bg_color(stats, lv_color_hex(0x101820), 0);
+    lv_obj_set_style_bg_opa(stats, LV_OPA_80, 0);
+
+    stat_cell(stats, 0, 80, "SPEED km/h", speed_value);
+    stat_cell(stats, 80, 80, "DIST km", distance_value);
+    stat_cell(stats, 160, 80, "TIME", elapsed_value);
+    stat_cell(stats, 240, 80, "CAD rpm", cadence_value);
 
     // Start after creating the UI so the cache's heap check includes its cost.
     cache_ready = map_frame::init();
@@ -153,8 +242,10 @@ void update(const gps::State& position)
     last_update_us = now;
     if (!cache_ready) {
         set_status("Not enough memory for map");
+        update_stats(position);
         return;
     }
+    update_stats(position);
     const bool valid = position.receiving && position.has_fix &&
                        std::isfinite(position.latitude) && std::isfinite(position.longitude) &&
                        position.latitude >= -90 && position.latitude <= 90 &&

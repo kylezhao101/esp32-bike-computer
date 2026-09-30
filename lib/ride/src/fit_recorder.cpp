@@ -252,7 +252,13 @@ bool init()
     return true;
 }
 
-bool start() { Item i{}; i.kind=Kind::Start; return task && queue && xQueueSend(queue,&i,0)==pdTRUE; }
+bool start()
+{
+    Item i{}; i.kind=Kind::Start;
+    if (!task || !queue || xQueueSend(queue,&i,0)!=pdTRUE) return false;
+    set_status(Status::WaitingForTime);
+    return true;
+}
 bool submit(const ride::RecordingSample& sample)
 {
     if (!queue || status()==Status::Error) return false;
@@ -261,6 +267,14 @@ bool submit(const ride::RecordingSample& sample)
     if (xQueueSend(queue,&i,0)!=pdTRUE) { set_status(Status::Error); return false; }
     return true;
 }
-bool stop(const ride::RideData& totals) { Item i{}; i.kind=Kind::Stop; i.totals=totals; return queue && xQueueSend(queue,&i,0)==pdTRUE; }
+bool stop(const ride::RideData& totals)
+{
+    Item i{}; i.kind=Kind::Stop; i.totals=totals;
+    if (!queue || xQueueSend(queue,&i,0)!=pdTRUE) {
+        set_status(Status::Error);
+        return false;
+    }
+    return true;
+}
 Status status() { portENTER_CRITICAL(&state_mux); auto s=current_status; portEXIT_CRITICAL(&state_mux); return s; }
 }
