@@ -1,4 +1,5 @@
 #include "map_frame.hpp"
+#include "sd_access.hpp"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -71,8 +72,10 @@ bool read_piece(Piece& piece, uint8_t* dest, int tile_x, int tile_y,
     char path[96];
     const int wrapped_x = (tile_x % tile_count + tile_count) % tile_count;
     std::snprintf(path, sizeof(path), "/sdcard/tiles1/%d/%d/%d.bin", zoom, wrapped_x, tile_y);
+    if (!sd_access::lock(portMAX_DELAY)) return false;
     FILE* file = std::fopen(path, "rb");
     if (!file) {
+        sd_access::unlock();
         ESP_LOGW("map_frame", "Missing tile %s", path);
         return false;
     }
@@ -123,6 +126,7 @@ bool read_piece(Piece& piece, uint8_t* dest, int tile_x, int tile_y,
         row += rows;
     }
     std::fclose(file);
+    sd_access::unlock();
     if (!ok) {
         ESP_LOGW("map_frame", "Invalid/unreadable tile %s (expected opaque I4 or RGB565)", path);
         return false;

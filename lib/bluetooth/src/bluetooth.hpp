@@ -15,6 +15,8 @@ namespace bluetooth
         std::uint32_t wheel_revs;
         std::uint8_t battery_percentage;
         bool wheel_valid;
+        bool wheel_supported;
+        bool crank_supported;
         std::uint32_t wheel_generation;
         std::int64_t speed_valid_until_us;
         std::int64_t cadence_valid_until_us;

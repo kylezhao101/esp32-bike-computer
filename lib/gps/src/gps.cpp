@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 
 #include "driver/uart.h"
 #include "esp_check.h"
@@ -33,6 +34,61 @@ double parse_coordinate(const char* value, char hemisphere) {
         result = -result;
     }
     return result;
+}
+
+bool digits(const char* value, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (value[i] < '0' || value[i] > '9') return false;
+    }
+    return true;
+}
+
+bool parse_rmc_utc(const char* time_field, const char* date_field, int64_t& seconds)
+{
+    if (!time_field || !date_field || std::strlen(time_field) < 6 ||
+        std::strlen(date_field) != 6 || !digits(time_field, 6) || !digits(date_field, 6))
+        return false;
+
+    const int hour = (time_field[0] - '0') * 10 + time_field[1] - '0';
+    const int minute = (time_field[2] - '0') * 10 + time_field[3] - '0';
+    const int second = (time_field[4] - '0') * 10 + time_field[5] - '0';
+    const int day = (date_field[0] - '0') * 10 + date_field[1] - '0';
+    const int month = (date_field[2] - '0') * 10 + date_field[3] - '0';
+    const int short_year = (date_field[4] - '0') * 10 + date_field[5] - '0';
+    const int year = short_year >= 80 ? 1900 + short_year : 2000 + short_year;
+    if (hour > 23 || minute > 59 || second > 60 || month < 1 || month > 12)
+        return false;
+
+    constexpr int month_lengths[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    const bool leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    const int days_in_month = month_lengths[month - 1] + (month == 2 && leap ? 1 : 0);
+    if (day < 1 || day > days_in_month) return false;
+
+    // Gregorian civil date to days since 1970-01-01 (UTC).
+    const int adjusted_year = year - (month <= 2);
+    const int era = (adjusted_year >= 0 ? adjusted_year : adjusted_year - 399) / 400;
+    const unsigned year_of_era = static_cast<unsigned>(adjusted_year - era * 400);
+    const unsigned adjusted_month = static_cast<unsigned>(month + (month > 2 ? -3 : 9));
+    const unsigned day_of_year = (153 * adjusted_month + 2) / 5 + day - 1;
+    const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 -
+                                year_of_era / 100 + day_of_year;
+    const int64_t days = int64_t(era) * 146097 + day_of_era - 719468;
+    seconds = days * 86400 + hour * 3600 + minute * 60 + second;
+    return true;
+}
+
+bool valid_position(const char* lat, const char* ns, const char* lon, const char* ew,
+                    double& latitude, double& longitude)
+{
+    if (!lat[0] || !ns[0] || !lon[0] || !ew[0] ||
+        (ns[0] != 'N' && ns[0] != 'S') || (ew[0] != 'E' && ew[0] != 'W'))
+        return false;
+    latitude = parse_coordinate(lat, ns[0]);
+    longitude = parse_coordinate(lon, ew[0]);
+    return std::isfinite(latitude) && std::isfinite(longitude) &&
+           latitude >= -90.0 && latitude <= 90.0 &&
+           longitude >= -180.0 && longitude <= 180.0;
 }
 
 bool valid_checksum(char* sentence) {
@@ -85,30 +141,49 @@ void handle_sentence(char* sentence) {
     if (std::strcmp(type, "GGA") == 0 && count > 7) {
         const int quality = std::atoi(fields[6]);
         state.satellites = std::atoi(fields[7]);
-        state.has_fix = quality > 0;
+        double latitude = 0.0;
+        double longitude = 0.0;
+        state.has_fix = quality > 0 && count > 5 &&
+                        valid_position(fields[2], fields[3], fields[4], fields[5],
+                                       latitude, longitude);
 
-        if (state.has_fix &&
-            fields[2][0] && fields[3][0] &&
-            fields[4][0] && fields[5][0]) {
-            state.latitude =
-                parse_coordinate(fields[2], fields[3][0]);
-            state.longitude =
-                parse_coordinate(fields[4], fields[5][0]);
+        if (state.has_fix) {
+            state.latitude = latitude;
+            state.longitude = longitude;
+            state.fix_updated_us = esp_timer_get_time();
         } else {
             state.latitude = 0.0;
             state.longitude = 0.0;
-            state.speed_kmh = 0.0f;
         }
     }
 
-    if (std::strcmp(type, "RMC") == 0 && count > 8) {
+    if (std::strcmp(type, "RMC") == 0 && count > 9) {
         if (fields[2][0] == 'A') {
-            state.speed_kmh =
-                static_cast<float>(std::atof(fields[7]) * 1.852);
-            state.course_deg =
-                static_cast<float>(std::atof(fields[8]));
+            int64_t utc_seconds = 0;
+            if (parse_rmc_utc(fields[1], fields[9], utc_seconds)) {
+                state.utc_seconds = utc_seconds;
+                state.utc_updated_us = last_message_us;
+                state.has_utc_time = true;
+            }
+            if (fields[7][0]) {
+                const float speed = static_cast<float>(std::atof(fields[7]) * 1.852);
+                if (std::isfinite(speed) && speed >= 0.0f) {
+                    state.speed_kmh = speed;
+                    state.speed_updated_us = last_message_us;
+                    state.has_speed = true;
+                } else {
+                    state.has_speed = false;
+                }
+            } else {
+                state.has_speed = false;
+                state.speed_kmh = 0.0f;
+            }
+            if (fields[8][0])
+                state.course_deg = static_cast<float>(std::atof(fields[8]));
         } else {
             state.has_fix = false;
+            state.has_utc_time = false;
+            state.has_speed = false;
             state.speed_kmh = 0.0f;
         }
     }
@@ -191,6 +266,13 @@ State get_state() {
         snapshot.satellites = 0;
         snapshot.speed_kmh = 0.0f;
     }
+    const int64_t now = esp_timer_get_time();
+    if (snapshot.has_fix && now - snapshot.fix_updated_us > DATA_TIMEOUT_US)
+        snapshot.has_fix = false;
+    if (snapshot.has_utc_time && now - snapshot.utc_updated_us > DATA_TIMEOUT_US)
+        snapshot.has_utc_time = false;
+    if (snapshot.has_speed && now - snapshot.speed_updated_us > DATA_TIMEOUT_US)
+        snapshot.has_speed = false;
     return snapshot;
 }
 

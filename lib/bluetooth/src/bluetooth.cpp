@@ -60,6 +60,8 @@ static const ble_uuid16_t battery_level_uuid =
 
 static bool have_previous_wheel = false;
 static bool have_previous_crank = false;
+static bool wheel_supported = false;
+static bool crank_supported = false;
 static uint32_t wheel_generation = 0;
 static int64_t previous_wheel_received_us = 0;
 static portMUX_TYPE sensor_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -96,6 +98,8 @@ static void publish_sensor_data()
     snapshot.wheel_revs = current_wheel_revs;
     snapshot.battery_percentage = current_battery_percentage;
     snapshot.wheel_valid = connected && have_previous_wheel;
+    snapshot.wheel_supported = connected && wheel_supported;
+    snapshot.crank_supported = connected && crank_supported;
     snapshot.wheel_generation = wheel_generation;
     snapshot.speed_valid_until_us = last_wheel_motion_us + MOTION_TIMEOUT_US;
     snapshot.cadence_valid_until_us = last_crank_motion_us + MOTION_TIMEOUT_US;
@@ -559,6 +563,11 @@ static void handle_csc_measurement(struct os_mbuf *om)
     }
 
     const int64_t now = esp_timer_get_time();
+    // CSC Measurement flags identify which cumulative revolution fields this
+    // sensor provides. Keep the capability for the connection lifetime so a
+    // stopped wheel/crank can be recorded as zero instead of missing data.
+    wheel_supported = wheel_supported || has_wheel;
+    crank_supported = crank_supported || has_crank;
     if (has_wheel)
     {
         if (have_previous_wheel)
@@ -784,6 +793,8 @@ static int gap_event_handler(
                     have_sensor_address = true;
                     connected = true;
                     battery_valid = false;
+                    wheel_supported = false;
+                    crank_supported = false;
                     connection_state = ConnectionState::Connected;
                     publish_sensor_data();
 
@@ -846,6 +857,8 @@ static int gap_event_handler(
 
             have_previous_wheel = false;
             have_previous_crank = false;
+            wheel_supported = false;
+            crank_supported = false;
             ++wheel_generation;
             last_wheel_motion_us = last_crank_motion_us = 0;
 

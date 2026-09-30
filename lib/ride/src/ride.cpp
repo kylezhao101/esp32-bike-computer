@@ -1,5 +1,6 @@
 #include "ride.hpp"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
 #include <algorithm>
 #include <cmath>
 
@@ -12,6 +13,8 @@ static int64_t last_us = 0;
 static int64_t moving_us = 0;
 static int64_t pedaling_us = 0;
 static double cadence_rpm_us = 0;
+static RecordingSample recording_sample{};
+static portMUX_TYPE recording_sample_mux = portMUX_INITIALIZER_UNLOCKED;
 static constexpr double WHEEL_KM = 2.105 / 1000.0;
 
 // Apply the previous reading only to the interval for which it was valid.
@@ -77,5 +80,20 @@ RideData get_ride_data()
 {
     advance(esp_timer_get_time());
     return data;
+}
+
+void publish_recording_sample(const RecordingSample& sample)
+{
+    portENTER_CRITICAL(&recording_sample_mux);
+    recording_sample = sample;
+    portEXIT_CRITICAL(&recording_sample_mux);
+}
+
+RecordingSample get_recording_sample()
+{
+    portENTER_CRITICAL(&recording_sample_mux);
+    const RecordingSample snapshot = recording_sample;
+    portEXIT_CRITICAL(&recording_sample_mux);
+    return snapshot;
 }
 } // namespace ride

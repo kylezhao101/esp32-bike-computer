@@ -33,7 +33,30 @@ namespace ride
         int64_t cadence_valid_until_us = 0;
     };
 
+    // Latest once-per-second snapshot for the future FIT writer. Availability
+    // flags distinguish missing/stale sensors from real zero readings.
+    struct RecordingSample
+    {
+        int64_t sampled_at_us = 0;
+        int64_t utc_seconds = 0;
+        bool utc_valid = false;
+        bool gps_fix_valid = false;
+        double latitude = 0.0;
+        double longitude = 0.0;
+        float speed_kmh = 0.0f;
+        bool speed_valid = false;
+        float cadence_rpm = 0.0f;
+        bool cadence_valid = false;
+        float distance_km = 0.0f;
+        uint32_t elapsed_seconds = 0;
+    };
+
     void update(const Sample& sample);
 
     RideData get_ride_data();
+
+    // The sampler publishes one coherent-by-source snapshot each second. The
+    // FIT writer can copy it safely from its own task when added.
+    void publish_recording_sample(const RecordingSample& sample);
+    RecordingSample get_recording_sample();
 }

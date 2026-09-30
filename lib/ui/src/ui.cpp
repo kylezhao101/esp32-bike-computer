@@ -12,6 +12,7 @@
 
 #include "bluetooth.hpp"
 #include "ride.hpp"
+#include "fit_recorder.hpp"
 #include "gps.hpp"
 
 #include "map_screen.hpp"
@@ -109,6 +110,41 @@ static void update_ride()
     ride::update(sample);
 }
 
+static ride::RecordingSample sample_ride_for_recording()
+{
+    const int64_t now = esp_timer_get_time();
+    const bluetooth::SensorData sensor = bluetooth::get_sensor_data();
+    const gps::State location = gps::get_state();
+    const ride::RideData totals = ride::get_ride_data();
+
+    ride::RecordingSample sample{};
+    sample.sampled_at_us = now;
+    sample.utc_seconds = location.utc_seconds;
+    sample.utc_valid = location.has_utc_time;
+    sample.gps_fix_valid = location.receiving && location.has_fix;
+    if (sample.gps_fix_valid) {
+        sample.latitude = location.latitude;
+        sample.longitude = location.longitude;
+    }
+    if (sensor.wheel_supported) {
+        sample.speed_kmh = now < sensor.speed_valid_until_us
+            ? sensor.speed_kmh : 0.0f;
+        sample.speed_valid = true;
+    } else if (location.has_speed) {
+        sample.speed_kmh = location.speed_kmh;
+        sample.speed_valid = true;
+    }
+    if (sensor.crank_supported) {
+        sample.cadence_rpm = now < sensor.cadence_valid_until_us
+            ? sensor.cadence_rpm : 0.0f;
+        sample.cadence_valid = true;
+    }
+    sample.distance_km = totals.distance_km;
+    sample.elapsed_seconds = totals.elapsed_seconds;
+    ride::publish_recording_sample(sample);
+    return sample;
+}
+
 
 static lv_obj_t* ride_button = nullptr;
 static lv_obj_t* ride_button_label = nullptr;
@@ -117,6 +153,7 @@ static lv_obj_t* sensor_info_label = nullptr;
 static lv_obj_t* gps_status_label = nullptr;
 static lv_obj_t* sensor_button = nullptr;
 static lv_obj_t* sensor_button_label = nullptr;
+static int64_t next_record_sample_us = 0;
 
 static void sensor_button_event_cb(lv_event_t* event)
 {
@@ -263,6 +300,10 @@ static void ride_button_event_cb(
     {
         update_ride();
         ride::stop();
+        auto final_sample = sample_ride_for_recording();
+        fit_recorder::submit(final_sample);
+        if (!fit_recorder::stop(ride::get_ride_data()))
+            ESP_LOGE("ui", "Could not queue FIT finalization");
 
         lv_label_set_text(
             ride_button_label,
@@ -271,8 +312,14 @@ static void ride_button_event_cb(
     }
     else
     {
+        if (!fit_recorder::start()) {
+            lv_label_set_text(gps_status_label, "FIT recorder unavailable");
+            return;
+        }
         ride::start();
         update_ride();
+        fit_recorder::submit(sample_ride_for_recording());
+        next_record_sample_us = esp_timer_get_time() + 1000000;
 
         lv_label_set_text(
             ride_button_label,
@@ -295,21 +342,28 @@ static void ui_task(void* param)
     char elapsed_text[32];
 
     uint32_t last_ui_update = ui_tick_ms();
-
     while (true)
     {
         lv_timer_handler();
         finish_display_transfer();
 
         const uint32_t now = ui_tick_ms();
+        if (ride::get_ride_data().active) {
+            const int64_t now_us = esp_timer_get_time();
+            if (now_us >= next_record_sample_us) {
+                // Do not fabricate catch-up records after a delayed UI pass.
+                // The monotonic timestamp records when this sample was taken.
+                update_ride();
+                fit_recorder::submit(sample_ride_for_recording());
+                next_record_sample_us = now_us + 1000000;
+            }
+        }
         if (now - last_ui_update >= 100)
         {
             last_ui_update = now;
 
             bluetooth::SensorData sensor_data =
                 bluetooth::get_sensor_data();
-
-            update_ride();
 
             ride::RideData ride_data =
                 ride::get_ride_data();
@@ -392,6 +446,11 @@ static void ui_task(void* param)
                     break;
             }
             lv_label_set_text(sensor_info_label, sensor_text);
+            const auto fit_state = fit_recorder::status();
+            if (ride_data.active && fit_state == fit_recorder::Status::WaitingForTime)
+                lv_label_set_text(sensor_info_label, "Recording | waiting for GPS time");
+            else if (fit_state == fit_recorder::Status::Error)
+                lv_label_set_text(sensor_info_label, "FIT write error | ride data at risk");
             if (state == bluetooth::ConnectionState::Connected) {
                 lv_obj_set_hidden(sensor_button, true);
             } else {
@@ -466,6 +525,7 @@ static void ui_task(void* param)
 
 void init()
 {
+    fit_recorder::init();
     display.init();
     display.initDMA();
     display.setSwapBytes(true);
