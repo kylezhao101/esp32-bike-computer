@@ -1,6 +1,7 @@
 #include "bluetooth.hpp"
 #include "gps.hpp"
 #include "ui.hpp"
+#include "wifi_files.hpp"
 
 #include <cstdio>
 #include <dirent.h>
@@ -66,6 +67,8 @@ static void check_sd_card()
 extern "C" void app_main() {
     check_sd_card();
     bluetooth::init();
+    if (!wifi_files::init())
+        printf("Wi-Fi file browser failed to start\n");
     gps::init();
     ui::init();
 }

@@ -14,6 +14,7 @@
 #include "ride.hpp"
 #include "fit_recorder.hpp"
 #include "gps.hpp"
+#include "wifi_files.hpp"
 
 #include "map_screen.hpp"
 #include <cstdio>
@@ -154,6 +155,8 @@ static lv_obj_t* ride_button_label = nullptr;
 
 static lv_obj_t* sensor_info_label = nullptr;
 static lv_obj_t* gps_status_label = nullptr;
+static lv_obj_t* wifi_status_label = nullptr;
+static lv_obj_t* wifi_start_button = nullptr;
 static lv_obj_t* sensor_button = nullptr;
 static lv_obj_t* sensor_button_label = nullptr;
 static lv_obj_t* fit_error_dialog = nullptr;
@@ -290,6 +293,17 @@ static void lvgl_flush_cb(
     );
     flush_pending = true;
     // The wait callback ends the transaction before LVGL reuses this buffer.
+}
+
+static void wifi_start_event_cb(lv_event_t* event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    bluetooth::pause_discovery_for_wifi();
+    map_screen::pause_for_wifi();
+    if (wifi_files::start()) {
+        lv_obj_add_state(wifi_start_button, LV_STATE_DISABLED);
+        lv_label_set_text(lv_obj_get_child(wifi_start_button, 0), "Starting...");
+    }
 }
 
 static void close_fit_error_event_cb(lv_event_t* event)
@@ -505,6 +519,10 @@ static void ui_task(void* param)
                     break;
             }
             lv_label_set_text(sensor_info_label, sensor_text);
+            char wifi_text[100];
+            wifi_files::display_status(wifi_text, sizeof(wifi_text));
+            if (wifi_status_label && std::strcmp(lv_label_get_text(wifi_status_label), wifi_text) != 0)
+                lv_label_set_text(wifi_status_label, wifi_text);
             const auto fit_state = fit_recorder::status();
             if (fit_state == fit_recorder::Status::Error &&
                 previous_fit_status != fit_recorder::Status::Error) {
@@ -918,25 +936,41 @@ void init()
     lv_label_set_text(sensor_page_title, "SENSORS");
     lv_obj_align(sensor_page_title, LV_ALIGN_TOP_LEFT, 16, 18);
 
+    wifi_status_label = lv_label_create(sensor_screen);
+    lv_obj_set_width(wifi_status_label, 288);
+    lv_obj_set_height(wifi_status_label, 42);
+    lv_label_set_long_mode(wifi_status_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(wifi_status_label, "Starting Wi-Fi...");
+    lv_obj_align(wifi_status_label, LV_ALIGN_TOP_LEFT, 16, 42);
+
     gps_status_label = lv_label_create(sensor_screen);
     lv_obj_set_width(gps_status_label, 288);
     lv_label_set_text(gps_status_label, "GPS disconnected");
-    lv_obj_align(gps_status_label, LV_ALIGN_TOP_LEFT, 16, 58);
+    lv_obj_align(gps_status_label, LV_ALIGN_TOP_LEFT, 16, 88);
 
     sensor_info_label = lv_label_create(sensor_screen);
     lv_obj_set_width(sensor_info_label, 288);
     lv_obj_set_height(sensor_info_label, 48);
     lv_label_set_long_mode(sensor_info_label, LV_LABEL_LONG_WRAP);
     lv_label_set_text(sensor_info_label, "Searching for sensor...");
-    lv_obj_align(sensor_info_label, LV_ALIGN_TOP_LEFT, 16, 88);
+    lv_obj_align(sensor_info_label, LV_ALIGN_TOP_LEFT, 16, 110);
 
     sensor_button = lv_button_create(sensor_screen);
     lv_obj_set_size(sensor_button, 90, 36);
-    lv_obj_align(sensor_button, LV_ALIGN_TOP_LEFT, 16, 146);
+    lv_obj_align(sensor_button, LV_ALIGN_TOP_LEFT, 16, 164);
     sensor_button_label = lv_label_create(sensor_button);
     lv_label_set_text(sensor_button_label, "Cancel");
     lv_obj_center(sensor_button_label);
     lv_obj_add_event_cb(sensor_button, sensor_button_event_cb,
+                       LV_EVENT_CLICKED, nullptr);
+
+    wifi_start_button = lv_button_create(sensor_screen);
+    lv_obj_set_size(wifi_start_button, 112, 34);
+    lv_obj_align(wifi_start_button, LV_ALIGN_BOTTOM_RIGHT, -8, -3);
+    lv_obj_t* wifi_start_label = lv_label_create(wifi_start_button);
+    lv_label_set_text(wifi_start_label, "Start Wi-Fi");
+    lv_obj_center(wifi_start_label);
+    lv_obj_add_event_cb(wifi_start_button, wifi_start_event_cb,
                        LV_EVENT_CLICKED, nullptr);
 
     lv_obj_t* back_button = lv_button_create(sensor_screen);

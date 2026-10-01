@@ -25,6 +25,7 @@ lv_obj_t* distance_value = nullptr;
 lv_obj_t* elapsed_value = nullptr;
 lv_obj_t* cadence_value = nullptr;
 bool cache_ready = false;
+bool paused_for_wifi = false;
 bool requested = false;
 bool load_failed = false;
 int active_frame = -1;
@@ -240,6 +241,11 @@ void update(const gps::State& position)
     const int64_t now = esp_timer_get_time();
     if (completed < 0 && last_update_us && now - last_update_us < 250000) return;
     last_update_us = now;
+    if (paused_for_wifi) {
+        set_status("Map paused while Wi-Fi is on | reboot to restore");
+        update_stats(position);
+        return;
+    }
     if (!cache_ready) {
         set_status("Not enough memory for map");
         update_stats(position);
@@ -296,5 +302,22 @@ void update(const gps::State& position)
                       had_fix ? "Last position" : "Preview");
     }
     set_status(text);
+}
+
+void pause_for_wifi()
+{
+    if (paused_for_wifi) return;
+    // Detach LVGL image sources before releasing the backing buffers.
+    for (auto* image : images) {
+        lv_image_set_src(image, nullptr);
+        lv_obj_set_hidden(image, true);
+    }
+    map_frame::release();
+    cache_ready = false;
+    requested = false;
+    loading_frame = -1;
+    active_frame = -1;
+    paused_for_wifi = true;
+    set_status("Map paused while Wi-Fi is on | reboot to restore");
 }
 } // namespace ui::map_screen

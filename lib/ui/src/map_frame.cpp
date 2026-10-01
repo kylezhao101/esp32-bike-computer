@@ -33,6 +33,7 @@ Frame frames[2];
 QueueHandle_t requests = nullptr;
 QueueHandle_t completed = nullptr;
 bool busy = false; // UI-thread only; queues transfer frame ownership.
+TaskHandle_t loader_task = nullptr;
 constexpr size_t read_buffer_bytes = 4096;
 constexpr size_t legacy_lookup_bytes = 4096;
 // Allocate worker scratch from the heap: ESP32's linker-accessible static
@@ -47,8 +48,11 @@ int floor_tile(int pixel)
     return result;
 }
 
-void make_legacy_lookup()
+bool make_legacy_lookup()
 {
+    if (legacy_lookup) return true;
+    legacy_lookup = static_cast<uint8_t*>(heap_caps_malloc(legacy_lookup_bytes, MALLOC_CAP_8BIT));
+    if (!legacy_lookup) return false;
     for (int key = 0; key < 4096; ++key) {
         const int r = ((key >> 8) & 15) * 17;
         const int g = ((key >> 4) & 15) * 17;
@@ -64,6 +68,7 @@ void make_legacy_lookup()
         }
         legacy_lookup[key] = best;
     }
+    return true;
 }
 
 bool read_piece(Piece& piece, uint8_t* dest, int tile_x, int tile_y,
@@ -90,6 +95,10 @@ bool read_piece(Piece& piece, uint8_t* dest, int tile_x, int tile_y,
          header.reserved_2 == 0 && header.w == tile_size && header.h == tile_size &&
          (indexed || header.cf == LV_COLOR_FORMAT_RGB565) && header.stride == source_stride;
     ok = ok && std::fseek(file, 0, SEEK_END) == 0 && std::ftell(file) == expected_size;
+    if (ok && !indexed && !make_legacy_lookup()) {
+        ESP_LOGE("map_frame", "Could not allocate 4 KiB RGB565 lookup table");
+        ok = false;
+    }
     if (ok && indexed) {
         ok = std::fseek(file, sizeof(header), SEEK_SET) == 0 &&
              std::fread(dest, 1, palette_bytes, file) == palette_bytes;
@@ -183,10 +192,14 @@ void load(Frame& frame, const Request& request)
 
 void loader(void*)
 {
-    make_legacy_lookup();
     Request request;
     for (;;) {
         if (xQueueReceive(requests, &request, portMAX_DELAY) != pdTRUE) continue;
+        if (request.index < 0) {
+            xQueueSend(completed, &request.index, portMAX_DELAY);
+            loader_task = nullptr;
+            vTaskDelete(nullptr);
+        }
         const int64_t start = esp_timer_get_time();
         Frame& frame = frames[request.index];
         load(frame, request);
@@ -207,24 +220,23 @@ bool init()
         frame.storage = static_cast<uint8_t*>(heap_caps_malloc(storage_bytes, MALLOC_CAP_8BIT));
     }
     read_buffer = static_cast<uint8_t*>(heap_caps_malloc(read_buffer_bytes, MALLOC_CAP_8BIT));
-    legacy_lookup = static_cast<uint8_t*>(heap_caps_malloc(legacy_lookup_bytes, MALLOC_CAP_8BIT));
     requests = xQueueCreate(1, sizeof(Request));
     completed = xQueueCreate(1, sizeof(int));
     // Retain headroom for task stacks, BLE, LVGL and filesystem allocations.
     const size_t remaining = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     const char* failure = nullptr;
     if (!frames[0].storage || !frames[1].storage) failure = "40 KiB viewport allocation";
-    else if (!read_buffer || !legacy_lookup) failure = "4 KiB scratch allocation";
+    else if (!read_buffer) failure = "4 KiB read-buffer allocation";
     else if (!requests || !completed) failure = "queue allocation";
-    else if (remaining < 32 * 1024) failure = "less than 32 KiB remaining headroom";
-    else if (xTaskCreate(loader, "map_loader", 4096, nullptr, 3, nullptr) != pdPASS)
+    else if (remaining < 24 * 1024) failure = "less than 24 KiB remaining headroom";
+    else if (xTaskCreate(loader, "map_loader", 4096, nullptr, 3, &loader_task) != pdPASS)
         failure = "loader task allocation";
     if (!failure) {
         ESP_LOGI("map_frame", "Two 40 KiB I4 viewport buffers ready");
         return true;
     }
     ESP_LOGE("map_frame", "Cache failed: %s; free %u, largest %u bytes; "
-             "viewport allocations %d/%d, scratch allocations %d/%d",
+             "viewport allocations %d/%d, read buffer %d, lazy RGB565 lookup %d",
              failure, static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_8BIT)),
              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
              frames[0].storage != nullptr, frames[1].storage != nullptr,
@@ -238,6 +250,31 @@ bool init()
     requests = completed = nullptr;
     ESP_LOGE("map_frame", "Not enough RAM/resources for indexed map cache");
     return false;
+}
+
+void release()
+{
+    if (!requests) return;
+    if (loader_task) {
+        const Request stop{-1, 0, 0};
+        xQueueSend(requests, &stop, portMAX_DELAY);
+        int completed_index;
+        do {
+            xQueueReceive(completed, &completed_index, portMAX_DELAY);
+        } while (completed_index != -1);
+    }
+    busy = false;
+    for (Frame& frame : frames) {
+        heap_caps_free(frame.storage);
+        frame.storage = nullptr;
+        frame.count = 0;
+    }
+    heap_caps_free(read_buffer);
+    heap_caps_free(legacy_lookup);
+    read_buffer = legacy_lookup = nullptr;
+    vQueueDelete(requests);
+    vQueueDelete(completed);
+    requests = completed = nullptr;
 }
 
 bool request(int index, int left, int top)

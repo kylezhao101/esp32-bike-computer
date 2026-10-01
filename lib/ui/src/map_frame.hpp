@@ -27,10 +27,11 @@ struct Frame {
     bool failed = false;
 };
 
-// UI-thread API. Two buffers live for the lifetime of the app. The worker owns
-// a requested buffer until poll() returns its index; it never calls LVGL.
-// Callers must detach every image using a buffer before requesting it again.
+// UI-thread API. The worker owns a requested buffer until poll() returns its
+// index; it never calls LVGL. Callers must detach every image using a buffer
+// before requesting it again or releasing the cache.
 bool init();
+void release();
 bool request(int index, int left, int top);
 int poll(); // -1 while idle/loading
 const Frame& get(int index);

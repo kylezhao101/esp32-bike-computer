@@ -25,6 +25,7 @@ namespace bluetooth
     void init();
     void search();
     void cancel_search();
+    void pause_discovery_for_wifi();
 
     SensorData get_sensor_data();
 }

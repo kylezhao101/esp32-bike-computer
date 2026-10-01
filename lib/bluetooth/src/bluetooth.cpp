@@ -690,6 +690,22 @@ void cancel_search()
     ble_npl_eventq_put(nimble_port_get_dflt_eventq(), &cancel_event);
 }
 
+void pause_discovery_for_wifi()
+{
+    auto state = get_sensor_data().connection_state;
+    if (state == ConnectionState::Connected || state == ConnectionState::Idle) return;
+
+    cancel_search();
+    // cancel_search() is handled on NimBLE's host queue. Wait briefly for it
+    // to stop scanning before bringing up Wi-Fi, which shares the radio.
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        state = get_sensor_data().connection_state;
+        if (state == ConnectionState::Connected || state == ConnectionState::Idle) return;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    printf("BLE scan did not stop before Wi-Fi startup\n");
+}
+
 static int gap_event_handler(
     struct ble_gap_event *event,
     void *arg
